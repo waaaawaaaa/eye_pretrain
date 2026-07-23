@@ -6,7 +6,7 @@ Pipeline:
 2. Deduplicate with perceptual hash (pHash)
 3. Crop black background
 4. Resize to 224x224
-5. Save processed images + manifest CSV
+5. Save as {dataset}__{original_stem}.jpg + manifest CSV
 """
 
 from __future__ import annotations
@@ -166,14 +166,28 @@ def is_duplicate(
     return False
 
 
-def load_resume_state(output_dir: Path) -> tuple[list[imagehash.ImageHash], int, set[str]]:
+def sanitize_name(name: str) -> str:
+    """Keep filesystem-friendly characters for output filenames."""
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    cleaned = "".join(ch if ch in allowed else "_" for ch in name.strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "unnamed"
+
+
+def make_output_name(source_name: str, src_path: Path) -> str:
+    """Name format: {dataset}__{original_stem}.jpg"""
+    dataset = sanitize_name(source_name)
+    stem = sanitize_name(src_path.stem)
+    return f"{dataset}__{stem}.jpg"
+
+
+def load_resume_state(output_dir: Path) -> tuple[list[imagehash.ImageHash], set[str]]:
     manifest_path = output_dir / "manifest.csv"
     seen_hashes: list[imagehash.ImageHash] = []
-    next_index = 1
     processed_src: set[str] = set()
 
     if not manifest_path.exists():
-        return seen_hashes, next_index, processed_src
+        return seen_hashes, processed_src
 
     with manifest_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -181,14 +195,7 @@ def load_resume_state(output_dir: Path) -> tuple[list[imagehash.ImageHash], int,
             processed_src.add(row["src_path"])
             if row["status"] == "saved" and row["phash"]:
                 seen_hashes.append(imagehash.hex_to_hash(row["phash"]))
-                output_name = row["output_name"]
-                if output_name.startswith("img_"):
-                    try:
-                        idx = int(output_name.replace("img_", "").replace(".jpg", ""))
-                        next_index = max(next_index, idx + 1)
-                    except ValueError:
-                        pass
-    return seen_hashes, next_index, processed_src
+    return seen_hashes, processed_src
 
 
 def write_manifest_row(manifest_path: Path, fieldnames: list[str], row: ProcessResult) -> None:
@@ -244,9 +251,8 @@ def main() -> int:
 
     seen_hashes: list[imagehash.ImageHash] = []
     processed_src: set[str] = set()
-    next_index = 1
     if args.resume:
-        seen_hashes, next_index, processed_src = load_resume_state(output_dir)
+        seen_hashes, processed_src = load_resume_state(output_dir)
 
     image_paths = list(iter_image_paths(input_dir, args.recursive))
     if args.limit > 0:
@@ -292,12 +298,30 @@ def main() -> int:
                 )
                 continue
 
-            output_name = f"img_{next_index:08d}.jpg"
+            output_name = make_output_name(source_name, src_path)
             output_path = images_dir / output_name
+            if output_path.exists() and not args.resume:
+                stats["failed"] += 1
+                write_manifest_row(
+                    manifest_path,
+                    fieldnames,
+                    ProcessResult(
+                        status="failed",
+                        src_path=src_str,
+                        output_name=output_name,
+                        source_dataset=source_name,
+                        phash=str(phash),
+                        orig_width=original.width,
+                        orig_height=original.height,
+                        crop_box=str(crop_box),
+                        message="output filename already exists",
+                    ),
+                )
+                continue
+
             resized.save(output_path, format="JPEG", quality=args.jpeg_quality, optimize=True)
 
             seen_hashes.append(phash)
-            next_index += 1
             stats["saved"] += 1
 
             write_manifest_row(
