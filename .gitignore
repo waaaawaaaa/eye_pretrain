@@ -1,0 +1,24 @@
+# 数据与图片
+dataset/
+pretrain_data/
+pretrain_data_test/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+
+# 第三方算法仓库（clone 下来的，不用提交）
+repos/
+
+# 虚拟环境
+.venv/
+venv/
+
+# Python 杂项
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
