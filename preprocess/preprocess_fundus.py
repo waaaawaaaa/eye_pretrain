@@ -4,7 +4,7 @@
 Pipeline:
 1. Scan input images
 2. Deduplicate with perceptual hash (pHash)
-3. Crop black background
+3. Crop black background (threshold + morphological opening to ignore speckles)
 4. Pad to square with black (0), then resize to 224x224 (keep aspect ratio)
 5. Save as {dataset}__{original_stem}.jpg + manifest CSV
 """
@@ -19,7 +19,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 import imagehash
 from tqdm import tqdm
 
@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=int,
-        default=10,
+        default=20,
         help="Grayscale threshold for non-black pixels when cropping.",
     )
     parser.add_argument(
@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Padding pixels added around detected ROI.",
+    )
+    parser.add_argument(
+        "--open_size",
+        type=int,
+        default=31,
+        help="Morphological opening kernel size to remove sparse bright noise before crop.",
     )
     parser.add_argument(
         "--size",
@@ -127,18 +133,62 @@ def load_rgb_image(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(img).convert("RGB")
 
 
-def crop_black_background(img: Image.Image, threshold: int, padding: int) -> tuple[Image.Image, tuple[int, int, int, int]]:
+def crop_black_background(
+    img: Image.Image,
+    threshold: int,
+    padding: int,
+    open_size: int = 31,
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Crop to fundus ROI.
+
+    Uses thresholding + morphological opening so sparse bright noise
+    (e.g. top-edge speckles) does not inflate the bounding box.
+    Mask is computed on a downscaled image for speed, then mapped back.
+    """
     gray = img.convert("L")
-    mask = gray.point(lambda p: 255 if p > threshold else 0)
-    bbox = mask.getbbox()
+    # Downscale for fast morphology; map bbox back to full resolution.
+    max_side = 512
+    scale = 1.0
+    work = gray
+    if max(gray.size) > max_side:
+        scale = max_side / max(gray.size)
+        work = gray.resize(
+            (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
+            Image.Resampling.BILINEAR,
+        )
+
+    mask = work.point(lambda p: 255 if p > threshold else 0)
+    # Kernel must be odd for Min/MaxFilter.
+    k = max(3, open_size if open_size % 2 == 1 else open_size + 1)
+    # Scale kernel with downscale so effective FOV cleaning stays similar.
+    if scale < 1.0:
+        k = max(3, int(round(k * scale)))
+        if k % 2 == 0:
+            k += 1
+    opened = mask.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
+    bbox = opened.getbbox()
+    if bbox is None:
+        # Fallback without morphology.
+        bbox = mask.getbbox()
     if bbox is None:
         return img.copy(), (0, 0, img.width, img.height)
 
     left, top, right, bottom = bbox
+    if scale < 1.0:
+        inv = 1.0 / scale
+        left = int(left * inv)
+        top = int(top * inv)
+        right = int(right * inv)
+        bottom = int(bottom * inv)
+
     left = max(0, left - padding)
     top = max(0, top - padding)
     right = min(img.width, right + padding)
     bottom = min(img.height, bottom + padding)
+    # Guard against empty/inverted boxes.
+    if right <= left or bottom <= top:
+        return img.copy(), (0, 0, img.width, img.height)
+
     crop_box = (left, top, right, bottom)
     return img.crop(crop_box), crop_box
 
@@ -236,6 +286,7 @@ def save_config(output_dir: Path, args: argparse.Namespace) -> None:
         "source_name": args.source_name or args.input_dir.name,
         "threshold": args.threshold,
         "padding": args.padding,
+        "open_size": args.open_size,
         "size": args.size,
         "jpeg_quality": args.jpeg_quality,
         "hash_size": args.hash_size,
@@ -298,7 +349,9 @@ def main() -> int:
 
         try:
             original = load_rgb_image(src_path)
-            cropped, crop_box = crop_black_background(original, args.threshold, args.padding)
+            cropped, crop_box = crop_black_background(
+                original, args.threshold, args.padding, open_size=args.open_size
+            )
             resized = resize_square(cropped, args.size)
             phash = compute_phash(resized, args.hash_size)
 
