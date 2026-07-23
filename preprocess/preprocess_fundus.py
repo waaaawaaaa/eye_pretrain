@@ -4,7 +4,7 @@
 Pipeline:
 1. Scan input images
 2. Deduplicate with perceptual hash (pHash)
-3. Crop black background (threshold + morphological opening to ignore speckles)
+3. Crop black background (threshold + largest connected component)
 4. Pad to square with black (0), then resize to 224x224 (keep aspect ratio)
 5. Save as {dataset}__{original_stem}.jpg + manifest CSV
 """
@@ -19,8 +19,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 import imagehash
+import numpy as np
+from scipy import ndimage
 from tqdm import tqdm
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=int,
-        default=20,
+        default=10,
         help="Grayscale threshold for non-black pixels when cropping.",
     )
     parser.add_argument(
@@ -70,12 +72,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Padding pixels added around detected ROI.",
-    )
-    parser.add_argument(
-        "--open_size",
-        type=int,
-        default=31,
-        help="Morphological opening kernel size to remove sparse bright noise before crop.",
     )
     parser.add_argument(
         "--size",
@@ -133,47 +129,84 @@ def load_rgb_image(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(img).convert("RGB")
 
 
+def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    if not rows.any() or not cols.any():
+        return None
+    y_idx = np.where(rows)[0]
+    x_idx = np.where(cols)[0]
+    top, bottom = int(y_idx[0]), int(y_idx[-1]) + 1
+    left, right = int(x_idx[0]), int(x_idx[-1]) + 1
+    return left, top, right, bottom
+
+
+def _largest_component_mask(mask: np.ndarray) -> np.ndarray:
+    labeled, num = ndimage.label(mask)
+    if num == 0:
+        return mask
+    counts = np.bincount(labeled.ravel())
+    counts[0] = 0
+    largest = int(counts.argmax())
+    return labeled == largest
+
+
 def crop_black_background(
     img: Image.Image,
     threshold: int,
     padding: int,
-    open_size: int = 31,
 ) -> tuple[Image.Image, tuple[int, int, int, int]]:
     """Crop to fundus ROI.
 
-    Uses thresholding + morphological opening so sparse bright noise
-    (e.g. top-edge speckles) does not inflate the bounding box.
-    Mask is computed on a downscaled image for speed, then mapped back.
+    Threshold on a downscaled grayscale image, keep the largest connected
+    component (drops sparse bright speckles), then map bbox back to full res.
+    For very dark images, threshold is lowered adaptively.
     """
-    gray = img.convert("L")
-    # Downscale for fast morphology; map bbox back to full resolution.
+    gray = np.asarray(img.convert("L"), dtype=np.uint8)
+    full_h, full_w = gray.shape
+
+    gmax = int(gray.max())
+    thr = threshold
+    if gmax < 100:
+        # Dark fundus: keep threshold from eating the circular FOV.
+        thr = min(threshold, max(5, gmax // 5))
+
     max_side = 512
     scale = 1.0
     work = gray
-    if max(gray.size) > max_side:
-        scale = max_side / max(gray.size)
-        work = gray.resize(
-            (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
-            Image.Resampling.BILINEAR,
+    if max(full_h, full_w) > max_side:
+        scale = max_side / max(full_h, full_w)
+        new_w = max(1, int(full_w * scale))
+        new_h = max(1, int(full_h * scale))
+        work = np.asarray(
+            Image.fromarray(gray).resize((new_w, new_h), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
         )
 
-    mask = work.point(lambda p: 255 if p > threshold else 0)
-    # Kernel must be odd for Min/MaxFilter.
-    k = max(3, open_size if open_size % 2 == 1 else open_size + 1)
-    # Scale kernel with downscale so effective FOV cleaning stays similar.
-    if scale < 1.0:
-        k = max(3, int(round(k * scale)))
-        if k % 2 == 0:
-            k += 1
-    opened = mask.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
-    bbox = opened.getbbox()
+    def bbox_at(t: int) -> tuple[int, int, int, int] | None:
+        comp = _largest_component_mask(work > t)
+        return _bbox_from_mask(comp)
+
+    bbox = bbox_at(thr)
     if bbox is None:
-        # Fallback without morphology.
-        bbox = mask.getbbox()
+        bbox = _bbox_from_mask(work > thr)
     if bbox is None:
         return img.copy(), (0, 0, img.width, img.height)
 
     left, top, right, bottom = bbox
+    cw, ch = right - left, bottom - top
+    aspect = cw / max(ch, 1)
+
+    # If crop is clearly not near-circular FOV, retry with a lower threshold.
+    if aspect < 0.75 or aspect > 1.35:
+        retry_thr = max(5, thr // 2)
+        if retry_thr != thr:
+            retry = bbox_at(retry_thr)
+            if retry is not None:
+                left, top, right, bottom = retry
+                cw, ch = right - left, bottom - top
+                aspect = cw / max(ch, 1)
+
     if scale < 1.0:
         inv = 1.0 / scale
         left = int(left * inv)
@@ -185,7 +218,6 @@ def crop_black_background(
     top = max(0, top - padding)
     right = min(img.width, right + padding)
     bottom = min(img.height, bottom + padding)
-    # Guard against empty/inverted boxes.
     if right <= left or bottom <= top:
         return img.copy(), (0, 0, img.width, img.height)
 
@@ -286,7 +318,6 @@ def save_config(output_dir: Path, args: argparse.Namespace) -> None:
         "source_name": args.source_name or args.input_dir.name,
         "threshold": args.threshold,
         "padding": args.padding,
-        "open_size": args.open_size,
         "size": args.size,
         "jpeg_quality": args.jpeg_quality,
         "hash_size": args.hash_size,
@@ -350,7 +381,7 @@ def main() -> int:
         try:
             original = load_rgb_image(src_path)
             cropped, crop_box = crop_black_background(
-                original, args.threshold, args.padding, open_size=args.open_size
+                original, args.threshold, args.padding
             )
             resized = resize_square(cropped, args.size)
             phash = compute_phash(resized, args.hash_size)
