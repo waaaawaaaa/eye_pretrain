@@ -4,9 +4,15 @@
 Pipeline:
 1. Scan input images
 2. Deduplicate with perceptual hash (pHash)
-3. Crop black background (threshold + largest connected component)
+3. Crop black background:
+   - grayscale
+   - min-max normalize (ROI detection only)
+   - threshold + largest connected component
 4. Pad to square with black (0), then resize to 224x224 (keep aspect ratio)
-5. Save as {dataset}__{original_stem}.jpg + manifest CSV
+5. Save RGB as {dataset}__{original_stem}.jpg + manifest CSV
+
+Note: normalization is only used to find the crop box.
+      The saved images remain original RGB (no training Normalize baked in).
 """
 
 from __future__ import annotations
@@ -65,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=int,
         default=10,
-        help="Grayscale threshold for non-black pixels when cropping.",
+        help="Threshold on min-max normalized grayscale [0,255] for ROI mask.",
     )
     parser.add_argument(
         "--padding",
@@ -125,11 +131,13 @@ def iter_image_paths(root: Path, recursive: bool) -> Iterable[Path]:
 
 
 def load_rgb_image(path: Path) -> Image.Image:
+    """Load image as RGB and fix EXIF orientation."""
     with Image.open(path) as img:
         return ImageOps.exif_transpose(img).convert("RGB")
 
 
 def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Return (left, top, right, bottom) from a boolean mask, or None if empty."""
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
     if not rows.any() or not cols.any():
@@ -142,13 +150,29 @@ def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
 
 
 def _largest_component_mask(mask: np.ndarray) -> np.ndarray:
+    """Keep only the largest connected component (drops sparse bright speckles)."""
     labeled, num = ndimage.label(mask)
     if num == 0:
         return mask
     counts = np.bincount(labeled.ravel())
-    counts[0] = 0
+    counts[0] = 0  # ignore background label
     largest = int(counts.argmax())
     return labeled == largest
+
+
+def minmax_normalize_u8(gray: np.ndarray) -> np.ndarray:
+    """Min-max normalize grayscale to [0, 255] uint8.
+
+    Makes bright and dark fundus images comparable before thresholding.
+    Used only for ROI detection, not for saving.
+    """
+    gmin = float(gray.min())
+    gmax = float(gray.max())
+    if gmax <= gmin + 1e-6:
+        # Nearly flat image: nothing meaningful to stretch.
+        return np.zeros_like(gray, dtype=np.uint8)
+    norm = (gray.astype(np.float32) - gmin) / (gmax - gmin)
+    return np.clip(norm * 255.0, 0, 255).astype(np.uint8)
 
 
 def crop_black_background(
@@ -156,21 +180,20 @@ def crop_black_background(
     threshold: int,
     padding: int,
 ) -> tuple[Image.Image, tuple[int, int, int, int]]:
-    """Crop to fundus ROI.
+    """Crop to fundus circular FOV (remove outer black border).
 
-    Threshold on a downscaled grayscale image, keep the largest connected
-    component (drops sparse bright speckles), then map bbox back to full res.
-    For very dark images, threshold is lowered adaptively.
+    Steps:
+    1) grayscale
+    2) optional downscale for speed
+    3) min-max normalize -> threshold (robust to dark/bright exposure)
+    4) largest connected component (ignore edge speckles)
+    5) map bbox back to full resolution and crop the original RGB
     """
+    # --- 1) grayscale from original RGB ---
     gray = np.asarray(img.convert("L"), dtype=np.uint8)
     full_h, full_w = gray.shape
 
-    gmax = int(gray.max())
-    thr = threshold
-    if gmax < 100:
-        # Dark fundus: keep threshold from eating the circular FOV.
-        thr = min(threshold, max(5, gmax // 5))
-
+    # --- 2) downscale for faster connected-component analysis ---
     max_side = 512
     scale = 1.0
     work = gray
@@ -183,13 +206,19 @@ def crop_black_background(
             dtype=np.uint8,
         )
 
+    # --- 3) normalize then threshold (ROI detection only) ---
+    work_norm = minmax_normalize_u8(work)
+
     def bbox_at(t: int) -> tuple[int, int, int, int] | None:
-        comp = _largest_component_mask(work > t)
+        # Binary mask -> keep largest blob -> bounding box
+        comp = _largest_component_mask(work_norm > t)
         return _bbox_from_mask(comp)
 
+    thr = max(1, min(int(threshold), 254))
     bbox = bbox_at(thr)
     if bbox is None:
-        bbox = _bbox_from_mask(work > thr)
+        # Fallback without connected-component filtering
+        bbox = _bbox_from_mask(work_norm > thr)
     if bbox is None:
         return img.copy(), (0, 0, img.width, img.height)
 
@@ -197,16 +226,15 @@ def crop_black_background(
     cw, ch = right - left, bottom - top
     aspect = cw / max(ch, 1)
 
-    # If crop is clearly not near-circular FOV, retry with a lower threshold.
+    # Fundus FOV is roughly circular; weird aspect => retry softer threshold.
     if aspect < 0.75 or aspect > 1.35:
-        retry_thr = max(5, thr // 2)
+        retry_thr = max(1, thr // 2)
         if retry_thr != thr:
             retry = bbox_at(retry_thr)
             if retry is not None:
                 left, top, right, bottom = retry
-                cw, ch = right - left, bottom - top
-                aspect = cw / max(ch, 1)
 
+    # --- 4) map downscaled bbox back to full-resolution coordinates ---
     if scale < 1.0:
         inv = 1.0 / scale
         left = int(left * inv)
@@ -221,12 +249,13 @@ def crop_black_background(
     if right <= left or bottom <= top:
         return img.copy(), (0, 0, img.width, img.height)
 
+    # --- 5) crop original RGB (not the normalized gray) ---
     crop_box = (left, top, right, bottom)
     return img.crop(crop_box), crop_box
 
 
 def pad_to_square(img: Image.Image, fill: int = 0) -> Image.Image:
-    """Pad image to square with constant fill (default black) without distorting shape."""
+    """Pad to square with constant fill so later resize does not stretch the eye."""
     w, h = img.size
     if w == h:
         return img.copy()
@@ -240,6 +269,7 @@ def pad_to_square(img: Image.Image, fill: int = 0) -> Image.Image:
         fill_color = (fill, fill, fill)
 
     canvas = Image.new(img.mode, (side, side), fill_color)
+    # Center the cropped fundus on the square canvas.
     offset = ((side - w) // 2, (side - h) // 2)
     canvas.paste(img, offset)
     return canvas
@@ -379,6 +409,7 @@ def main() -> int:
             continue
 
         try:
+            # Load RGB -> crop FOV (normalize only for detection) -> pad+resize -> hash/save
             original = load_rgb_image(src_path)
             cropped, crop_box = crop_black_background(
                 original, args.threshold, args.padding
