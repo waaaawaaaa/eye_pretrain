@@ -5,7 +5,7 @@ Pipeline:
 1. Scan input images
 2. Deduplicate with perceptual hash (pHash)
 3. Crop black background
-4. Resize to 224x224
+4. Pad to square with black (0), then resize to 224x224 (keep aspect ratio)
 5. Save as {dataset}__{original_stem}.jpg + manifest CSV
 """
 
@@ -143,8 +143,30 @@ def crop_black_background(img: Image.Image, threshold: int, padding: int) -> tup
     return img.crop(crop_box), crop_box
 
 
+def pad_to_square(img: Image.Image, fill: int = 0) -> Image.Image:
+    """Pad image to square with constant fill (default black) without distorting shape."""
+    w, h = img.size
+    if w == h:
+        return img.copy()
+
+    side = max(w, h)
+    if img.mode == "RGB":
+        fill_color = (fill, fill, fill)
+    elif img.mode == "L":
+        fill_color = fill
+    else:
+        fill_color = (fill, fill, fill)
+
+    canvas = Image.new(img.mode, (side, side), fill_color)
+    offset = ((side - w) // 2, (side - h) // 2)
+    canvas.paste(img, offset)
+    return canvas
+
+
 def resize_square(img: Image.Image, size: int) -> Image.Image:
-    return img.resize((size, size), Image.Resampling.LANCZOS)
+    """Pad to square with black, then resize. Preserves eyeball aspect ratio."""
+    squared = pad_to_square(img, fill=0)
+    return squared.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def compute_phash(img: Image.Image, hash_size: int) -> imagehash.ImageHash:
