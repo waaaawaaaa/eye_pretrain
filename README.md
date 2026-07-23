@@ -1,0 +1,2 @@
+# eye_pretrain
+使用AIROGS，eyepacs两个眼科的数据集测试自监督预训练的代码
